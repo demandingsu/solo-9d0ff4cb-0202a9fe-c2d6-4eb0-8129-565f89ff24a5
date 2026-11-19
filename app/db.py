@@ -30,12 +30,43 @@ CREATE TABLE IF NOT EXISTS segments (
     count          INTEGER NOT NULL CHECK (count >= 0)
 );
 
+-- 复卷纸追溯：原卷（kind='raw'）与成卷（kind='finished'）统一登记。
+-- 原卷登记长度并关联已有质检登记号；成卷长度为各接段长度之和。
+CREATE TABLE IF NOT EXISTS rolls (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind           TEXT NOT NULL CHECK (kind IN ('raw', 'finished')),
+    length_mm      INTEGER NOT NULL CHECK (length_mm > 0),
+    inspection_id  INTEGER REFERENCES inspections(id),
+    note           TEXT,
+    created_at     TEXT NOT NULL,
+    CHECK (kind = 'finished' OR inspection_id IS NOT NULL)
+);
+
+-- 成卷的接段：按 seq 记录接入顺序，来源可以是原卷或另一成卷。
+-- 区间含起点不含终点：source_lo <= x < source_hi。
+CREATE TABLE IF NOT EXISTS splices (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    roll_id         INTEGER NOT NULL REFERENCES rolls(id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL CHECK (seq >= 1),
+    source_roll_id  INTEGER NOT NULL REFERENCES rolls(id),
+    source_lo       INTEGER NOT NULL CHECK (source_lo >= 0),
+    source_hi       INTEGER NOT NULL CHECK (source_hi > source_lo),
+    reversed        INTEGER NOT NULL CHECK (reversed IN (0, 1)),
+    UNIQUE (roll_id, seq)
+);
+
 CREATE INDEX IF NOT EXISTS idx_reports_inspection
     ON count_reports(inspection_id);
 CREATE INDEX IF NOT EXISTS idx_segments_inspection
     ON segments(inspection_id);
 CREATE INDEX IF NOT EXISTS idx_segments_report
     ON segments(report_id);
+CREATE INDEX IF NOT EXISTS idx_splices_roll
+    ON splices(roll_id);
+CREATE INDEX IF NOT EXISTS idx_splices_source
+    ON splices(source_roll_id);
+CREATE INDEX IF NOT EXISTS idx_rolls_inspection
+    ON rolls(inspection_id);
 """
 
 
@@ -183,3 +214,203 @@ def get_reports(connection: sqlite3.Connection, inspection_id: int) -> list[dict
         }
         for report in reports
     ]
+
+
+# ---------------------------------------------------------------------------
+# 复卷纸追溯：卷与接段
+# ---------------------------------------------------------------------------
+
+
+def create_raw_roll(
+    connection: sqlite3.Connection,
+    length_mm: int,
+    inspection_id: int,
+    note: str | None,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO rolls (kind, length_mm, inspection_id, note, created_at)
+        VALUES ('raw', ?, ?, ?, ?)
+        """,
+        (length_mm, inspection_id, note, now()),
+    )
+    return int(cursor.lastrowid)
+
+
+def create_finished_roll(connection: sqlite3.Connection, note: str | None) -> int:
+    # 长度由接段决定：先放占位值 1（满足 length_mm > 0 的 CHECK），
+    # 接段写入并校验后由调用方更新为实际长度。
+    cursor = connection.execute(
+        """
+        INSERT INTO rolls (kind, length_mm, inspection_id, note, created_at)
+        VALUES ('finished', 1, NULL, ?, ?)
+        """,
+        (note, now()),
+    )
+    return int(cursor.lastrowid)
+
+
+def get_roll(connection: sqlite3.Connection, roll_id: int) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT r.id, r.kind, r.length_mm, r.inspection_id, r.note, r.created_at,
+               (SELECT COUNT(*) FROM splices s WHERE s.roll_id = r.id) AS splice_count
+        FROM rolls r
+        WHERE r.id = ?
+        """,
+        (roll_id,),
+    ).fetchone()
+
+
+def list_rolls(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT r.id, r.kind, r.length_mm, r.inspection_id, r.note, r.created_at,
+               (SELECT COUNT(*) FROM splices s WHERE s.roll_id = r.id) AS splice_count
+        FROM rolls r
+        ORDER BY r.id
+        """
+    ).fetchall()
+
+
+def update_roll_length(
+    connection: sqlite3.Connection, roll_id: int, length_mm: int
+) -> None:
+    connection.execute(
+        "UPDATE rolls SET length_mm = ? WHERE id = ?",
+        (length_mm, roll_id),
+    )
+
+
+def update_roll_note(
+    connection: sqlite3.Connection, roll_id: int, note: str | None
+) -> None:
+    connection.execute(
+        "UPDATE rolls SET note = ? WHERE id = ?",
+        (note, roll_id),
+    )
+
+
+def next_splice_seq(connection: sqlite3.Connection, roll_id: int) -> int:
+    row = connection.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM splices WHERE roll_id = ?",
+        (roll_id,),
+    ).fetchone()
+    return int(row["next_seq"])
+
+
+def insert_splice(
+    connection: sqlite3.Connection,
+    roll_id: int,
+    seq: int,
+    source_roll_id: int,
+    source_lo: int,
+    source_hi: int,
+    reversed_flag: bool,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO splices
+            (roll_id, seq, source_roll_id, source_lo, source_hi, reversed)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (roll_id, seq, source_roll_id, source_lo, source_hi, int(reversed_flag)),
+    )
+    return int(cursor.lastrowid)
+
+
+def get_splice(
+    connection: sqlite3.Connection, splice_id: int
+) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT * FROM splices WHERE id = ?",
+        (splice_id,),
+    ).fetchone()
+
+
+def update_splice(
+    connection: sqlite3.Connection,
+    splice_id: int,
+    source_roll_id: int,
+    source_lo: int,
+    source_hi: int,
+    reversed_flag: bool,
+) -> None:
+    connection.execute(
+        """
+        UPDATE splices
+        SET source_roll_id = ?, source_lo = ?, source_hi = ?, reversed = ?
+        WHERE id = ?
+        """,
+        (source_roll_id, source_lo, source_hi, int(reversed_flag), splice_id),
+    )
+
+
+def list_splices(
+    connection: sqlite3.Connection, roll_id: int
+) -> list[dict]:
+    """按接入顺序返回成卷的接段，并算出每段在成卷上的 [start, end)。"""
+    rows = connection.execute(
+        """
+        SELECT id, roll_id, seq, source_roll_id, source_lo, source_hi, reversed
+        FROM splices
+        WHERE roll_id = ?
+        ORDER BY seq
+        """,
+        (roll_id,),
+    ).fetchall()
+    result: list[dict] = []
+    cursor_pos = 0
+    for row in rows:
+        length = int(row["source_hi"]) - int(row["source_lo"])
+        result.append(
+            {
+                "id": int(row["id"]),
+                "roll_id": int(row["roll_id"]),
+                "seq": int(row["seq"]),
+                "start": cursor_pos,
+                "end": cursor_pos + length,
+                "source_roll_id": int(row["source_roll_id"]),
+                "source_lo": int(row["source_lo"]),
+                "source_hi": int(row["source_hi"]),
+                "reversed": bool(row["reversed"]),
+            }
+        )
+        cursor_pos += length
+    return result
+
+
+def load_rolls(connection: sqlite3.Connection) -> dict[int, dict]:
+    """一次性载入全部卷，供事务内的领域校验与追溯使用。"""
+    rolls: dict[int, dict] = {}
+    for row in connection.execute("SELECT * FROM rolls ORDER BY id").fetchall():
+        rolls[int(row["id"])] = {
+            "id": int(row["id"]),
+            "kind": row["kind"],
+            "length_mm": int(row["length_mm"]),
+            "inspection_id": row["inspection_id"],
+            "note": row["note"],
+            "created_at": row["created_at"],
+        }
+    return rolls
+
+
+def load_splices(connection: sqlite3.Connection) -> dict[int, list[dict]]:
+    """载入全部接段，按所属成卷 id 分组并保持接入顺序。"""
+    grouped: dict[int, list[dict]] = {}
+    rows = connection.execute(
+        "SELECT * FROM splices ORDER BY roll_id, seq"
+    ).fetchall()
+    for row in rows:
+        grouped.setdefault(int(row["roll_id"]), []).append(
+            {
+                "id": int(row["id"]),
+                "roll_id": int(row["roll_id"]),
+                "seq": int(row["seq"]),
+                "source_roll_id": int(row["source_roll_id"]),
+                "source_lo": int(row["source_lo"]),
+                "source_hi": int(row["source_hi"]),
+                "reversed": bool(row["reversed"]),
+            }
+        )
+    return grouped
